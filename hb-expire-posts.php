@@ -13,6 +13,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+require_once __DIR__ . '/plugin-update-checker/plugin-update-checker.php';
+
+$hb_expire_posts_update_checker = YahnisElsts\PluginUpdateChecker\v5\PucFactory::buildUpdateChecker(
+	'https://github.com/hoverboard88/hb-expire-posts/',
+	__FILE__,
+	'hb-expire-posts'
+);
+$hb_expire_posts_update_checker->setBranch( 'main' );
+
 /**
  * Function to check if a post is expired.
  *
