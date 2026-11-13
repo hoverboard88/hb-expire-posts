@@ -4,7 +4,7 @@
  * Description: Automatically expire posts after a specified time.
  * Author: Hoverboard
  * Author URI: https://hoverboardstudios.com
- * Version: 1.0.0
+ * Version: 1.1.0
  *
  * @package ExpirePosts
  */
@@ -95,9 +95,11 @@ function check_all_posts_for_expiration() {
 		'post_status'    => 'publish',
 		'posts_per_page' => -1, // Get all posts.
 		'meta_query'     => array( // phpcs:ignore
+			// Skip the '' rows older versions saved for blank fields.
 			array(
 				'key'     => '_expiration_time',
-				'compare' => 'EXISTS',
+				'value'   => '',
+				'compare' => '!=',
 			),
 		),
 		'fields'         => 'ids', // Return only post IDs.
@@ -144,15 +146,76 @@ add_action( 'add_meta_boxes', 'add_expiration_meta_box' );
  */
 function render_expiration_meta_box( $post ) {
 	wp_nonce_field( 'save_expiration_meta_box', 'expiration_meta_box_nonce' );
-	$expiration_time = get_post_meta( $post->ID, '_expiration_time', true );
+	$expiration = expire_posts_parse_expiration( get_post_meta( $post->ID, '_expiration_time', true ) );
 	?>
 
-	<label for="expiration_time"><?php esc_html_e( 'Expiration Time:', 'expire-posts' ); ?></label>
-	<input type="datetime-local" id="expiration_time" name="expiration_time" value="<?php echo esc_attr( $expiration_time ); ?>" />
+	<p>
+		<label for="expiration_date"><?php esc_html_e( 'Date:', 'expire-posts' ); ?></label><br />
+		<input type="date" id="expiration_date" name="expiration_date" value="<?php echo esc_attr( $expiration ? $expiration->format( 'Y-m-d' ) : '' ); ?>" />
+	</p>
+	<p>
+		<label for="expiration_time"><?php esc_html_e( 'Time (optional):', 'expire-posts' ); ?></label><br />
+		<input type="time" id="expiration_time" name="expiration_time" value="<?php echo esc_attr( $expiration ? $expiration->format( 'H:i' ) : '' ); ?>" />
+	</p>
+
+	<?php if ( $expiration ) : ?>
+		<?php if ( 'publish' === $post->post_status && $expiration->getTimestamp() < time() ) : ?>
+			<p class="notice notice-warning inline" style="margin:0 0 1em;padding:6px 8px;">
+				<?php
+				printf(
+					/* translators: %s: expiration date and time. */
+					esc_html__( 'This date (%s) has passed. The post will be set to draft at the next hourly check.', 'expire-posts' ),
+					esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $expiration->getTimestamp() ) )
+				);
+				?>
+			</p>
+		<?php else : ?>
+			<p>
+				<?php
+				printf(
+					/* translators: %s: expiration date and time. */
+					esc_html__( 'Expires: %s', 'expire-posts' ),
+					'<strong>' . esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $expiration->getTimestamp() ) ) . '</strong>'
+				);
+				?>
+			</p>
+		<?php endif; ?>
+	<?php endif; ?>
+
 	<p class="description">
-		<?php echo wp_kses_post( 'Enter the expiration date and time in the <strong>' . get_option( 'timezone_string' ) . '</strong> time zone. The post will be expired after this time.' ); ?>
+		<?php
+		printf(
+			/* translators: %s: site time zone. */
+			esc_html__( 'Times are in the %s time zone. Leave the time blank to expire at the end of the day (11:59 pm). Clear the date to remove the expiration.', 'expire-posts' ),
+			'<strong>' . esc_html( wp_timezone_string() ) . '</strong>'
+		);
+		?>
 	</p>
 	<?php
+}
+
+/**
+ * Parse a stored expiration value into a DateTimeImmutable in the site time zone.
+ *
+ * Values are stored as `Y-m-d\TH:i` (the format the old datetime-local input
+ * submitted), so existing data keeps working.
+ *
+ * @param string $value The stored or submitted value.
+ * @return DateTimeImmutable|false The parsed date, or false if empty or invalid.
+ */
+function expire_posts_parse_expiration( $value ) {
+	if ( ! is_string( $value ) || '' === $value ) {
+		return false;
+	}
+
+	$date = DateTimeImmutable::createFromFormat( '!Y-m-d\TH:i', $value, wp_timezone() );
+
+	// Reject overflowed values such as 2026-02-31, which PHP would roll forward.
+	if ( ! $date || $date->format( 'Y-m-d\TH:i' ) !== $value ) {
+		return false;
+	}
+
+	return $date;
 }
 /**
  * Function to save the expiration time when the post is saved.
@@ -166,11 +229,38 @@ function save_expiration_meta_box( $post_id ) {
 	if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
 		return;
 	}
+	if ( wp_is_post_revision( $post_id ) ) {
+		return;
+	}
 	if ( ! current_user_can( 'edit_post', $post_id ) ) {
 		return;
 	}
-	$expiration_time = isset( $_POST['expiration_time'] ) ? sanitize_text_field( wp_unslash( $_POST['expiration_time'] ) ) : 0;
-	update_post_meta( $post_id, '_expiration_time', $expiration_time );
+	if ( ! isset( $_POST['expiration_date'] ) ) {
+		return;
+	}
+
+	$date = sanitize_text_field( wp_unslash( $_POST['expiration_date'] ) );
+	$time = isset( $_POST['expiration_time'] ) ? sanitize_text_field( wp_unslash( $_POST['expiration_time'] ) ) : '';
+
+	// No date means no expiration. Remove the row rather than storing ''.
+	if ( '' === $date ) {
+		delete_post_meta( $post_id, '_expiration_time' );
+		return;
+	}
+
+	// A date without a time expires at the end of that day.
+	if ( '' === $time ) {
+		$time = '23:59';
+	}
+
+	$expiration = expire_posts_parse_expiration( $date . 'T' . $time );
+
+	// Leave any existing value alone rather than overwrite it with junk.
+	if ( ! $expiration ) {
+		return;
+	}
+
+	update_post_meta( $post_id, '_expiration_time', $expiration->format( 'Y-m-d\TH:i' ) );
 }
 add_action( 'save_post', 'save_expiration_meta_box' );
 
